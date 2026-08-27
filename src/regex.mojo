@@ -1,6 +1,5 @@
 """Ordered backtracking bytecode interpreter used by the Python bindings."""
 
-from std.algorithm import parallelize
 from std.sys import simd_width_of
 
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
@@ -86,31 +85,7 @@ def find_prefix(
     flags: Int,
     results: IPtr,
 ) -> Int:
-    comptime PARALLEL_THRESHOLD = 4_000_000
-    comptime TASKS = 8
-    if stop - start < PARALLEL_THRESHOLD or (
-        flags & FLAG_IGNORECASE
-    ) != 0:
-        return find_prefix_serial(text, start, stop, prefix, flags)
-
-    var chunk = (stop - start + TASKS - 1) // TASKS
-
-    @parameter
-    def scan_chunk(index: Int):
-        var first = start + index * chunk
-        var last = min(stop, first + chunk)
-        if first < stop:
-            results[index] = Int64(
-                find_prefix_serial(text, first, last, prefix, flags)
-            )
-        else:
-            results[index] = Int64(stop)
-
-    parallelize[scan_chunk](TASKS, TASKS)
-    var found = stop
-    for index in range(TASKS):
-        found = min(found, Int(results[index]))
-    return found
+    return find_prefix_serial(text, start, stop, prefix, flags)
 
 
 def class_matches(
