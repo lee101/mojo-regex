@@ -19,9 +19,9 @@ def lib() -> ctypes.CDLL:
             raise RuntimeError("Mojo library is missing; run `pixi run build`")
         _lib = ctypes.CDLL(os.fspath(LIB))
         fn = _lib.mrx_exec
-        fn.argtypes = [I] * 20
+        fn.argtypes = [I] * 21
         fn.restype = I
         find_all = _lib.mrx_find_all
-        find_all.argtypes = [I] * 24
+        find_all.argtypes = [I] * 25
         find_all.restype = I
     return _lib

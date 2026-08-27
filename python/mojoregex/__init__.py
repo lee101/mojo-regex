@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from array import array
+import ctypes
 from enum import IntFlag
+from functools import lru_cache
 import sys
 from typing import Any, Callable, Iterator
 
@@ -61,6 +63,10 @@ _KNOWN_FLAGS = (
     | WORD | VERBOSE
 )
 
+_unicode_utf8 = ctypes.pythonapi.PyUnicode_AsUTF8AndSize
+_unicode_utf8.argtypes = [ctypes.py_object, ctypes.POINTER(ctypes.c_ssize_t)]
+_unicode_utf8.restype = ctypes.c_void_p
+
 
 def _address(values, dtype) -> int:
     if isinstance(values, np.ndarray):
@@ -79,14 +85,24 @@ def _address(values, dtype) -> int:
     return address
 
 
-def _text_array(value: str | bytes) -> np.ndarray:
+def _text_array(value: str | bytes, force_wide: bool = False) -> np.ndarray:
     if isinstance(value, str):
-        encoding = "utf-32-le" if sys.byteorder == "little" else "utf-32-be"
-        values = np.frombuffer(
-            value.encode(encoding, errors="surrogatepass"), dtype=np.uint32
-        )
+        if value.isascii() and not force_wide:
+            size = ctypes.c_ssize_t()
+            address = _unicode_utf8(value, ctypes.byref(size))
+            if not address:
+                raise RuntimeError("could not access the string buffer")
+            buffer = (ctypes.c_uint8 * size.value).from_address(address)
+            values = np.ctypeslib.as_array(buffer)
+        else:
+            encoding = "utf-32-le" if sys.byteorder == "little" else "utf-32-be"
+            values = np.frombuffer(
+                value.encode(encoding, errors="surrogatepass"), dtype=np.uint32
+            )
     elif isinstance(value, bytes):
-        values = np.frombuffer(value, dtype=np.uint8).astype(np.uint32)
+        values = np.frombuffer(value, dtype=np.uint8)
+        if force_wide:
+            values = values.astype(np.uint32)
     else:
         raise TypeError("expected string or bytes-like object")
     if len(values) == 0:
@@ -175,7 +191,8 @@ class Match:
 class Pattern:
     __slots__ = (
         "pattern", "flags", "groups", "groupindex", "_indexgroup", "_code",
-        "_ranges", "_prefix", "_bytes", "_has_loop", "_cycle_writes",
+        "_ranges", "_prefix", "_bytes", "_has_loop", "_has_repeat_class",
+        "_cycle_writes",
     )
 
     def __init__(self, pattern: str | bytes, flags: int = 0):
@@ -218,6 +235,7 @@ class Pattern:
             if instruction[0] == 4 and instruction[1] <= i
         ]
         self._has_loop = bool(loops)
+        self._has_repeat_class = any(instruction[0] == 15 for instruction in instructions)
         cyclic = set()
         for start, stop in loops:
             cyclic.update(range(start, stop + 1))
@@ -273,7 +291,12 @@ class Pattern:
         span = max(0, endpos - pos)
         instruction_count = len(self._code) // 3
         if _prepared is None:
-            text = _text_array(string)
+            text = _text_array(
+                string,
+                force_wide=(
+                    mode == 2 and span >= 65_536 and self._has_repeat_class
+                ),
+            )
             scratch = self._scratch(span)
         else:
             text, scratch = _prepared
@@ -284,7 +307,8 @@ class Pattern:
             status = lib().mrx_exec(
                 _address(self._code, np.int64), instruction_count,
                 _address(self._ranges, np.int64),
-                _address(text, np.uint32), len(string), pos, endpos, mode,
+                _address(text, text.dtype), len(string), text.itemsize,
+                pos, endpos, mode,
                 int(self.flags), self._prefix, _address(captures, np.int64),
                 slot_count, _address(stack_pc, np.int64),
                 _address(stack_pos, np.int64), _address(stack_log, np.int64),
@@ -375,7 +399,8 @@ class Pattern:
             count = lib().mrx_find_all(
                 _address(self._code, np.int64), instruction_count,
                 _address(self._ranges, np.int64),
-                _address(text, np.uint32), len(string), pos, endpos, 0,
+                _address(text, text.dtype), len(string), text.itemsize,
+                pos, endpos, 0,
                 int(self.flags), self._prefix, _address(captures, np.int64),
                 slot_count, _address(stack_pc, np.int64),
                 _address(stack_pos, np.int64), _address(stack_log, np.int64),
@@ -398,19 +423,23 @@ class Pattern:
                 raise RuntimeError(f"Mojo regex engine failed with status {count}")
             rows = results[:count].tolist()
             if self.groups == 0:
-                values.extend(string[row[0]:row[1]] for row in rows)
+                batch_values = [string[row[0]:row[1]] for row in rows]
             elif self.groups == 1:
-                values.extend(
+                batch_values = [
                     empty if row[2] < 0 else string[row[2]:row[3]]
                     for row in rows
-                )
+                ]
             else:
-                values.extend(tuple(
+                batch_values = [tuple(
                     empty if row[group * 2] < 0 else string[
                         row[group * 2]:row[group * 2 + 1]
                     ]
                     for group in range(1, self.groups + 1)
-                ) for row in rows)
+                ) for row in rows]
+            if values:
+                values.extend(batch_values)
+            else:
+                values = batch_values
             if count == 0:
                 break
         return values
@@ -539,6 +568,11 @@ def _expand(template, found: Match):
     return "".join(result)
 
 
+@lru_cache(maxsize=512)
+def _compile_cached(pattern: str | bytes, flags: int) -> Pattern:
+    return Pattern(pattern, flags)
+
+
 def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None, **kwargs) -> Pattern:
     if kwargs:
         raise ValueError(f"unused keyword arguments: {', '.join(kwargs)}")
@@ -546,7 +580,10 @@ def compile(pattern, flags=0, ignore_unused=False, cache_pattern=None, **kwargs)
         if flags:
             raise ValueError("cannot process flags argument with a compiled pattern")
         return pattern
-    return Pattern(pattern, flags)
+    flags = int(flags)
+    if cache_pattern is False:
+        return Pattern(pattern, flags)
+    return _compile_cached(pattern, flags)
 
 
 def search(pattern, string, flags=0, pos=None, endpos=None, partial=False, concurrent=None, timeout=None, **kwargs):
@@ -623,6 +660,7 @@ def escape(pattern, special_only=True, literal_spaces=False):
 
 
 def purge():
+    _compile_cached.cache_clear()
     return None
 
 

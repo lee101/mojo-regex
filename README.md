@@ -80,31 +80,38 @@ by Mojo time, so values below 1 mean Mojo is slower.
 
 | case | mojoregex | regex | upstream / Mojo | result |
 |---|---:|---:|---:|:---|
-| literal search, match at 1M | 1.096 ms | 0.807 ms | 0.74x | Mojo slower |
-| identifier fullmatch, 500k | 1.731 ms | 16.017 ms | 9.25x | Mojo faster |
-| structured search, 720k | 0.753 ms | 0.763 ms | 1.01x | Mojo faster |
-| capturing backreference, 200k | 0.268 ms | 0.765 ms | 2.85x | Mojo faster |
-| findall, 10k words | 3.766 ms | 3.861 ms | 1.03x | Mojo faster |
+| literal search, match at 1M | 0.404 ms | 0.684 ms | 1.69x | Mojo faster |
+| identifier fullmatch, 500k | 0.902 ms | 8.946 ms | 9.92x | Mojo faster |
+| structured search, 720k | 0.282 ms | 0.644 ms | 2.28x | Mojo faster |
+| capturing backreference, 200k | 0.087 ms | 0.538 ms | 6.18x | Mojo faster |
+| findall, 10k words | 3.637 ms | 3.852 ms | 1.06x | Mojo faster |
 
-Prefix scans, simple greedy repeats, and backreference comparisons use SIMD
-with scalar remainder loops. Long prefix scans can use independent parallel
-chunks, while smaller scans stay serial. `findall` returns matches in native
-batches instead of crossing the FFI once per result.
+Prefix scans, simple greedy repeats, character-class repeats, and backreference
+comparisons use SIMD with scalar remainder loops. Prefix scans above four
+million characters use independent parallel chunks; smaller scans stay serial.
+Repeated module-level calls reuse a bounded compiled-pattern cache, and
+`findall` returns matches in native batches instead of crossing the FFI once per
+result.
 
-No GPU path is included.
+No GPU path is included. Regex scanning is comparison- and memory-bound, with
+well under the roughly two arithmetic operations per byte needed to offset GPU
+transfer and launch costs. The `max` dependency supplies CPU `parallelize`; it
+is not used for GPU execution.
 
 ## How it works
 
 The Python parser lowers the pattern into fixed-width instructions
-`(opcode, a, b)` stored as contiguous signed 64-bit words. Input text is a
-contiguous `UInt32` code-point buffer, so match and capture offsets are Python
-character indices even for non-ASCII literals; bytes use the same representation
-with values 0 through 255. Character-set ranges are a second contiguous
-`Int64` buffer.
+`(opcode, a, b)` stored as contiguous signed 64-bit words. ASCII strings and
+bytes use their native one-byte representation; non-ASCII input uses a
+contiguous `UInt32` code-point buffer. Match and capture offsets therefore stay
+Python character indices. Character-set ranges are a second contiguous `Int64`
+buffer.
 
 The ctypes boundary passes buffers as integer addresses after Python verifies
-their exact dtype, contiguous layout, and non-null address. The arrays remain
-strongly referenced for the entire native call. The exported Mojo functions
+their exact dtype, contiguous layout, and non-null address. ASCII strings use
+CPython's UTF-8 storage directly, bytes use a NumPy `frombuffer` view, and the
+inputs remain strongly referenced for the entire native call. The exported Mojo
+functions
 validate lengths, bounds, capacities, modes, and addresses before reconstructing
 them with
 `UnsafePointer[..., AnyOrigin[mut=True]]`, as required by this Mojo dialect.
@@ -113,11 +120,11 @@ caller-owned stack. Capture writes use a rollback log, so failed alternatives
 restore the exact prior capture state without copying every capture at every
 branch. Python owns all code, input, stack, log, and output memory; the native
 call allocates nothing and returns either a match, no match, or a retry signal
-if a scratch arena must grow. Python creates code-point views and uninitialized
-scratch arenas with NumPy; those buffers cross the FFI boundary zero-copy.
+if a scratch arena must grow. Python creates uninitialized scratch arenas with
+NumPy; those buffers cross the FFI boundary zero-copy.
 
-`finditer`, substitution, and splitting prepare the code-point buffer and
-scratch arena once and reuse them for the whole scan. `findall` additionally
+`finditer`, substitution, and splitting prepare the input view and scratch
+arena once and reuse them for the whole scan. `findall` additionally
 collects up to 16,384 results per native call.
 
 ## Development

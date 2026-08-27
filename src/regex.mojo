@@ -1,9 +1,13 @@
 """Ordered backtracking bytecode interpreter used by the Python bindings."""
 
 from std.sys import simd_width_of
+from max.algorithm import parallelize
 
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime UPtr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
+comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime PREFIX_PARALLEL_THRESHOLD = 4_000_000
+comptime PREFIX_WORKERS = 16
 
 comptime OP_MATCH = 0
 comptime OP_CHAR = 1
@@ -47,18 +51,49 @@ def chars_equal(a: Int, b: Int, flags: Int) -> Bool:
     return a == b
 
 
+@always_inline
+def text_value(text: UPtr, bytes_text: BPtr, text_width: Int, i: Int) -> Int:
+    if text_width == 1:
+        return Int(bytes_text[i])
+    return Int(text[i])
+
+
 def find_prefix_serial(
-    text: UPtr, start: Int, stop: Int, prefix: Int, flags: Int
+    text: UPtr,
+    bytes_text: BPtr,
+    text_width: Int,
+    start: Int,
+    stop: Int,
+    prefix: Int,
+    flags: Int,
 ) -> Int:
     var i = start
     if (flags & FLAG_IGNORECASE) != 0:
         while i < stop:
-            if chars_equal(Int(text[i]), prefix, flags):
+            if chars_equal(text_value(text, bytes_text, text_width, i), prefix, flags):
                 return i
             i += 1
         return stop
 
     comptime W = simd_width_of[DType.float64]()
+    if text_width == 1:
+        var byte_target = SIMD[DType.uint8, W](UInt8(prefix))
+        var byte_ones = SIMD[DType.uint8, W](1)
+        var byte_zeros = SIMD[DType.uint8, W](0)
+        while i + W <= stop:
+            var values = bytes_text.load[width=W](i)
+            var matches = values.eq(byte_target).select(byte_ones, byte_zeros)
+            if Int(matches.reduce_add()[0]) != 0:
+                for lane in range(W):
+                    if Int(values[lane]) == prefix:
+                        return i + lane
+            i += W
+        while i < stop:
+            if Int(bytes_text[i]) == prefix:
+                return i
+            i += 1
+        return stop
+
     var target = SIMD[DType.uint32, W](UInt32(prefix))
     var ones = SIMD[DType.uint32, W](1)
     var zeros = SIMD[DType.uint32, W](0)
@@ -79,13 +114,35 @@ def find_prefix_serial(
 
 def find_prefix(
     text: UPtr,
+    bytes_text: BPtr,
+    text_width: Int,
     start: Int,
     stop: Int,
     prefix: Int,
     flags: Int,
     results: IPtr,
 ) -> Int:
-    return find_prefix_serial(text, start, stop, prefix, flags)
+    var length = stop - start
+    if text_width == 1 and prefix > 255:
+        return stop
+    if length <= PREFIX_PARALLEL_THRESHOLD:
+        return find_prefix_serial(
+            text, bytes_text, text_width, start, stop, prefix, flags
+        )
+    var chunks = min(PREFIX_WORKERS, (length + PREFIX_PARALLEL_THRESHOLD - 1) // PREFIX_PARALLEL_THRESHOLD)
+    var chunk_size = (length + chunks - 1) // chunks
+    @__parameter
+    def work(chunk: Int):
+        var chunk_start = start + chunk * chunk_size
+        var chunk_stop = min(chunk_start + chunk_size, stop)
+        results[chunk] = Int64(find_prefix_serial(
+            text, bytes_text, text_width, chunk_start, chunk_stop, prefix, flags
+        ))
+    parallelize[work](chunks, chunks)
+    var found = stop
+    for chunk in range(chunks):
+        found = min(found, Int(results[chunk]))
+    return found
 
 
 def class_matches(
@@ -106,7 +163,37 @@ def class_matches(
     return not inside if negated else inside
 
 
-def class_vector_matches(
+def byte_class_vector_matches(
+    bytes_text: BPtr,
+    position: Int,
+    ranges: IPtr,
+    offset: Int,
+    encoded_count: Int,
+) -> Bool:
+    comptime W = simd_width_of[DType.float64]()
+    var values = bytes_text.load[width=W](position)
+    var inside = SIMD[DType.bool, W](fill=False)
+    var count = encoded_count
+    var negated = False
+    if count < 0:
+        count = -count - 1
+        negated = True
+    for ri in range(count):
+        var lo_value = Int(ranges[(offset + ri) * 2])
+        var hi_value = Int(ranges[(offset + ri) * 2 + 1])
+        if lo_value <= 255:
+            var lo = SIMD[DType.uint8, W](UInt8(lo_value))
+            var hi = SIMD[DType.uint8, W](UInt8(min(hi_value, 255)))
+            inside = inside | (values.ge(lo) & values.le(hi))
+    if negated:
+        inside = ~inside
+    var matches = inside.select(
+        SIMD[DType.uint8, W](1), SIMD[DType.uint8, W](0)
+    )
+    return Int(matches.reduce_add()[0]) == W
+
+
+def wide_class_vector_matches(
     text: UPtr,
     position: Int,
     ranges: IPtr,
@@ -138,11 +225,25 @@ def class_vector_matches(
 
 
 def char_vector_matches(
-    text: UPtr, position: Int, value: Int, flags: Int
+    text: UPtr,
+    bytes_text: BPtr,
+    text_width: Int,
+    position: Int,
+    value: Int,
+    flags: Int,
 ) -> Bool:
     comptime W = simd_width_of[DType.float64]()
     if (flags & FLAG_IGNORECASE) != 0:
         return False
+    if text_width == 1:
+        if value > 255:
+            return False
+        var values = bytes_text.load[width=W](position)
+        var expected = SIMD[DType.uint8, W](UInt8(value))
+        var matches = values.eq(expected).select(
+            SIMD[DType.uint8, W](1), SIMD[DType.uint8, W](0)
+        )
+        return Int(matches.reduce_add()[0]) == W
     var values = text.load[width=W](position)
     var expected = SIMD[DType.uint32, W](UInt32(value))
     var matches = values.eq(expected).select(
@@ -158,6 +259,7 @@ def mrx_exec(
     ranges_addr: Int,
     text_addr: Int,
     text_len: Int,
+    text_width: Int,
     start_pos: Int,
     end_pos: Int,
     mode: Int,
@@ -182,7 +284,9 @@ def mrx_exec(
         return -4
     if code_len <= 0 or text_len < 0 or start_pos < 0 or (
         start_pos > text_len or end_pos < 0 or end_pos > text_len
-    ) or mode < 0 or mode > 3 or prefix < -1 or prefix > 0x10FFFF:
+    ) or mode < 0 or mode > 3 or prefix < -1 or prefix > 0x10FFFF or (
+        text_width != 1 and text_width != 4
+    ):
         return -4
     if capture_count < 4 or capture_count % 2 != 0 or (
         stack_capacity < 8 or log_capacity <= 0
@@ -192,6 +296,7 @@ def mrx_exec(
     var code = IPtr(unsafe_from_address=code_addr)
     var ranges = IPtr(unsafe_from_address=ranges_addr)
     var text = UPtr(unsafe_from_address=text_addr)
+    var bytes_text = BPtr(unsafe_from_address=text_addr)
     var captures = IPtr(unsafe_from_address=captures_addr)
     var stack_pc = IPtr(unsafe_from_address=stack_pc_addr)
     var stack_pos = IPtr(unsafe_from_address=stack_pos_addr)
@@ -207,12 +312,12 @@ def mrx_exec(
         if prefix >= 0:
             if mode == 1 or mode == 2:
                 if candidate >= end_pos or not chars_equal(
-                    Int(text[candidate]), prefix, flags
+                    text_value(text, bytes_text, text_width, candidate), prefix, flags
                 ):
                     return 0
             else:
                 candidate = find_prefix(
-                    text, candidate, end_pos, prefix, flags, stack_min
+                    text, bytes_text, text_width, candidate, end_pos, prefix, flags, stack_min
                 )
                 if candidate >= end_pos:
                     return 0
@@ -243,14 +348,18 @@ def mrx_exec(
                         return 1
                     failed = True
                 elif op == OP_CHAR:
-                    if pos < end_pos and chars_equal(Int(text[pos]), a, flags):
+                    if pos < end_pos and chars_equal(
+                        text_value(text, bytes_text, text_width, pos), a, flags
+                    ):
                         pos += 1
                         pc += 1
                     else:
                         failed = True
                 elif op == OP_ANY:
                     if pos < end_pos and (
-                        (flags & FLAG_DOTALL) != 0 or Int(text[pos]) != 10
+                        (flags & FLAG_DOTALL) != 0 or text_value(
+                            text, bytes_text, text_width, pos
+                        ) != 10
                     ):
                         pos += 1
                         pc += 1
@@ -260,7 +369,9 @@ def mrx_exec(
                     if pos >= end_pos:
                         failed = True
                     else:
-                        if class_matches(Int(text[pos]), ranges, a, b):
+                        if class_matches(
+                            text_value(text, bytes_text, text_width, pos), ranges, a, b
+                        ):
                             pos += 1
                             pc += 1
                         else:
@@ -288,18 +399,20 @@ def mrx_exec(
                     if pos == 0 or (
                         (flags & FLAG_MULTILINE) != 0
                         and pos > 0
-                        and Int(text[pos - 1]) == 10
+                        and text_value(text, bytes_text, text_width, pos - 1) == 10
                     ):
                         pc += 1
                     else:
                         failed = True
                 elif op == OP_EOL:
                     if pos == end_pos or (
-                        pos + 1 == end_pos and Int(text[pos]) == 10
+                        pos + 1 == end_pos and text_value(
+                            text, bytes_text, text_width, pos
+                        ) == 10
                     ) or (
                         (flags & FLAG_MULTILINE) != 0
                         and pos < end_pos
-                        and Int(text[pos]) == 10
+                        and text_value(text, bytes_text, text_width, pos) == 10
                     ):
                         pc += 1
                     else:
@@ -315,20 +428,35 @@ def mrx_exec(
                         comptime W = simd_width_of[DType.float64]()
                         var j = 0
                         if (flags & FLAG_IGNORECASE) == 0:
-                            while j + W <= length:
-                                var left = text.load[width=W](s + j)
-                                var right = text.load[width=W](pos + j)
-                                var equal = left.eq(right).select(
-                                    SIMD[DType.uint32, W](1),
-                                    SIMD[DType.uint32, W](0),
-                                )
-                                if Int(equal.reduce_add()[0]) != W:
-                                    same = False
-                                    break
-                                j += W
+                            if text_width == 1:
+                                while j + W <= length:
+                                    var left = bytes_text.load[width=W](s + j)
+                                    var right = bytes_text.load[width=W](pos + j)
+                                    var equal = left.eq(right).select(
+                                        SIMD[DType.uint8, W](1),
+                                        SIMD[DType.uint8, W](0),
+                                    )
+                                    if Int(equal.reduce_add()[0]) != W:
+                                        same = False
+                                        break
+                                    j += W
+                            else:
+                                while j + W <= length:
+                                    var left = text.load[width=W](s + j)
+                                    var right = text.load[width=W](pos + j)
+                                    var equal = left.eq(right).select(
+                                        SIMD[DType.uint32, W](1),
+                                        SIMD[DType.uint32, W](0),
+                                    )
+                                    if Int(equal.reduce_add()[0]) != W:
+                                        same = False
+                                        break
+                                    j += W
                         while same and j < length:
                             if not chars_equal(
-                                Int(text[s + j]), Int(text[pos + j]), flags
+                                text_value(text, bytes_text, text_width, s + j),
+                                text_value(text, bytes_text, text_width, pos + j),
+                                flags,
                             ):
                                 same = False
                                 break
@@ -339,8 +467,12 @@ def mrx_exec(
                         else:
                             failed = True
                 elif op == OP_BOUNDARY or op == OP_NOT_BOUNDARY:
-                    var left = pos > 0 and is_word(Int(text[pos - 1]))
-                    var right = pos < end_pos and is_word(Int(text[pos]))
+                    var left = pos > 0 and is_word(
+                        text_value(text, bytes_text, text_width, pos - 1)
+                    )
+                    var right = pos < end_pos and is_word(
+                        text_value(text, bytes_text, text_width, pos)
+                    )
                     var boundary = left != right
                     if (op == OP_BOUNDARY and boundary) or (
                         op == OP_NOT_BOUNDARY and not boundary
@@ -378,13 +510,20 @@ def mrx_exec(
                     var repeat_start = pos
                     var consumed = 0
                     comptime W = simd_width_of[DType.float64]()
-                    while pos + W <= end_pos and class_vector_matches(
-                        text, pos, ranges, a, b
-                    ):
-                        pos += W
-                        consumed += W
+                    if text_width == 1:
+                        while pos + W <= end_pos and byte_class_vector_matches(
+                            bytes_text, pos, ranges, a, b
+                        ):
+                            pos += W
+                            consumed += W
+                    else:
+                        while pos + W <= end_pos and wide_class_vector_matches(
+                            text, pos, ranges, a, b
+                        ):
+                            pos += W
+                            consumed += W
                     while pos < end_pos and class_matches(
-                        Int(text[pos]), ranges, a, b
+                        text_value(text, bytes_text, text_width, pos), ranges, a, b
                     ):
                         pos += 1
                         consumed += 1
@@ -407,12 +546,12 @@ def mrx_exec(
                     var consumed = 0
                     comptime W = simd_width_of[DType.float64]()
                     while pos + W <= end_pos and char_vector_matches(
-                        text, pos, a, flags
+                        text, bytes_text, text_width, pos, a, flags
                     ):
                         pos += W
                         consumed += W
                     while pos < end_pos and chars_equal(
-                        Int(text[pos]), a, flags
+                        text_value(text, bytes_text, text_width, pos), a, flags
                     ):
                         pos += 1
                         consumed += 1
@@ -467,6 +606,7 @@ def mrx_find_all(
     ranges_addr: Int,
     text_addr: Int,
     text_len: Int,
+    text_width: Int,
     start_pos: Int,
     end_pos: Int,
     mode: Int,
@@ -505,6 +645,7 @@ def mrx_find_all(
             ranges_addr,
             text_addr,
             text_len,
+            text_width,
             cursor,
             end_pos,
             0,
@@ -544,6 +685,7 @@ def mrx_find_all(
                 ranges_addr,
                 text_addr,
                 text_len,
+                text_width,
                 match_start,
                 end_pos,
                 3,

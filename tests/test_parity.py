@@ -228,6 +228,15 @@ def test_splititer_and_purge_api():
     assert mojoregex.purge() is None
 
 
+def test_compile_cache_and_explicit_bypass():
+    mojoregex.purge()
+    first = mojoregex.compile("cached")
+    assert mojoregex.compile("cached") is first
+    assert mojoregex.compile("cached", cache_pattern=False) is not first
+    mojoregex.purge()
+    assert mojoregex.compile("cached") is not first
+
+
 def test_simd_tail_and_repeat_backtracking_parity():
     repeated = "a" * 37
     cases = [
@@ -238,6 +247,19 @@ def test_simd_tail_and_repeat_backtracking_parity():
     for pattern, text in cases:
         assert signature(mojoregex.fullmatch(pattern, text)) == signature(
             regex.fullmatch(pattern, text)
+        )
+
+
+def test_ascii_zero_copy_and_unicode_buffer_widths():
+    ascii_text = "ascii input"
+    ascii_values = mojoregex._text_array(ascii_text)
+    assert ascii_values.dtype == np.uint8
+    assert ascii_values.tobytes() == ascii_text.encode()
+    assert mojoregex._text_array(b"bytes").dtype == np.uint8
+    assert mojoregex._text_array("é界").dtype == np.uint32
+    for pattern in ("é", "é+"):
+        assert signature(mojoregex.search(pattern, "plain ascii")) == signature(
+            regex.search(pattern, "plain ascii")
         )
 
 
@@ -262,7 +284,7 @@ def test_native_buffer_contract_rejects_wrong_dtype_and_stride():
 
 
 def test_native_entry_point_rejects_null_buffers():
-    assert _lib.lib().mrx_exec(*([0] * 20)) == -4
+    assert _lib.lib().mrx_exec(*([0] * 21)) == -4
 
 
 def test_findall_retries_when_scratch_is_too_small(monkeypatch):
