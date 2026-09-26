@@ -1,7 +1,6 @@
 """Ordered backtracking bytecode interpreter used by the Python bindings."""
 
 from std.sys import simd_width_of
-from max.algorithm import parallelize
 
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime UPtr = UnsafePointer[UInt32, AnyOrigin[mut=True]]
@@ -131,14 +130,12 @@ def find_prefix(
         )
     var chunks = min(PREFIX_WORKERS, (length + PREFIX_PARALLEL_THRESHOLD - 1) // PREFIX_PARALLEL_THRESHOLD)
     var chunk_size = (length + chunks - 1) // chunks
-    @__parameter
-    def work(chunk: Int):
+    for chunk in range(chunks):
         var chunk_start = start + chunk * chunk_size
         var chunk_stop = min(chunk_start + chunk_size, stop)
         results[chunk] = Int64(find_prefix_serial(
             text, bytes_text, text_width, chunk_start, chunk_stop, prefix, flags
         ))
-    parallelize[work](chunks, chunks)
     var found = stop
     for chunk in range(chunks):
         found = min(found, Int(results[chunk]))

@@ -88,15 +88,18 @@ by Mojo time, so values below 1 mean Mojo is slower.
 
 Prefix scans, simple greedy repeats, character-class repeats, and backreference
 comparisons use SIMD with scalar remainder loops. Prefix scans above four
-million characters use independent parallel chunks; smaller scans stay serial.
+million characters are split into independent chunks and reduced to the
+earliest match; smaller scans stay on a single fused loop.
 Repeated module-level calls reuse a bounded compiled-pattern cache, and
 `findall` returns matches in native batches instead of crossing the FFI once per
 result.
 
 No GPU path is included. Regex scanning is comparison- and memory-bound, with
 well under the roughly two arithmetic operations per byte needed to offset GPU
-transfer and launch costs. The `max` dependency supplies CPU `parallelize`; it
-is not used for GPU execution.
+transfer and launch costs. There is no CPU `parallelize` call anywhere in this
+port: a prefix scan is one byte comparison per input byte, so it is bandwidth
+bound, and the chunked reduction scans every chunk to completion before taking
+the minimum anyway.
 
 ## How it works
 
