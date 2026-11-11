@@ -80,7 +80,7 @@ def find_prefix_serial(
         var byte_ones = SIMD[DType.uint8, W](1)
         var byte_zeros = SIMD[DType.uint8, W](0)
         while i + W <= stop:
-            var values = bytes_text.load[width=W](i)
+            var values = bytes_text.unsafe_load[width=W](i)
             var matches = values.eq(byte_target).select(byte_ones, byte_zeros)
             if Int(matches.reduce_add()[0]) != 0:
                 for lane in range(W):
@@ -97,7 +97,7 @@ def find_prefix_serial(
     var ones = SIMD[DType.uint32, W](1)
     var zeros = SIMD[DType.uint32, W](0)
     while i + W <= stop:
-        var values = text.load[width=W](i)
+        var values = text.unsafe_load[width=W](i)
         var matches = values.eq(target).select(ones, zeros)
         if Int(matches.reduce_add()[0]) != 0:
             for lane in range(W):
@@ -168,7 +168,7 @@ def byte_class_vector_matches(
     encoded_count: Int,
 ) -> Bool:
     comptime W = simd_width_of[DType.float64]()
-    var values = bytes_text.load[width=W](position)
+    var values = bytes_text.unsafe_load[width=W](position)
     var inside = SIMD[DType.bool, W](fill=False)
     var count = encoded_count
     var negated = False
@@ -198,7 +198,7 @@ def wide_class_vector_matches(
     encoded_count: Int,
 ) -> Bool:
     comptime W = simd_width_of[DType.float64]()
-    var values = text.load[width=W](position)
+    var values = text.unsafe_load[width=W](position)
     var inside = SIMD[DType.bool, W](fill=False)
     var count = encoded_count
     var negated = False
@@ -235,13 +235,13 @@ def char_vector_matches(
     if text_width == 1:
         if value > 255:
             return False
-        var values = bytes_text.load[width=W](position)
+        var values = bytes_text.unsafe_load[width=W](position)
         var expected = SIMD[DType.uint8, W](UInt8(value))
         var matches = values.eq(expected).select(
             SIMD[DType.uint8, W](1), SIMD[DType.uint8, W](0)
         )
         return Int(matches.reduce_add()[0]) == W
-    var values = text.load[width=W](position)
+    var values = text.unsafe_load[width=W](position)
     var expected = SIMD[DType.uint32, W](UInt32(value))
     var matches = values.eq(expected).select(
         SIMD[DType.uint32, W](1), SIMD[DType.uint32, W](0)
@@ -427,8 +427,8 @@ def mrx_exec(
                         if (flags & FLAG_IGNORECASE) == 0:
                             if text_width == 1:
                                 while j + W <= length:
-                                    var left = bytes_text.load[width=W](s + j)
-                                    var right = bytes_text.load[width=W](pos + j)
+                                    var left = bytes_text.unsafe_load[width=W](s + j)
+                                    var right = bytes_text.unsafe_load[width=W](pos + j)
                                     var equal = left.eq(right).select(
                                         SIMD[DType.uint8, W](1),
                                         SIMD[DType.uint8, W](0),
@@ -439,8 +439,8 @@ def mrx_exec(
                                     j += W
                             else:
                                 while j + W <= length:
-                                    var left = text.load[width=W](s + j)
-                                    var right = text.load[width=W](pos + j)
+                                    var left = text.unsafe_load[width=W](s + j)
+                                    var right = text.unsafe_load[width=W](pos + j)
                                     var equal = left.eq(right).select(
                                         SIMD[DType.uint32, W](1),
                                         SIMD[DType.uint32, W](0),
